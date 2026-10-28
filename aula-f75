@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""CLI helper for Aula F75 Max: lighting, battery, performance, game mode, clock sync."""
+import argparse
+import ctypes
+import datetime
+import sys
+import time
+
+LIB = ctypes.CDLL("libhidapi-hidraw.so.0")
+
+class hid_device_info(ctypes.Structure):
+    pass
+
+hid_device_info._fields_ = [
+    ("path", ctypes.c_char_p),
+    ("vendor_id", ctypes.c_ushort),
+    ("product_id", ctypes.c_ushort),
+    ("serial_number", ctypes.c_wchar_p),
+    ("release_number", ctypes.c_ushort),
+    ("manufacturer_string", ctypes.c_wchar_p),
+    ("product_string", ctypes.c_wchar_p),
+    ("usage_page", ctypes.c_ushort),
+    ("usage", ctypes.c_ushort),
+    ("interface_number", ctypes.c_int),
+    ("next", ctypes.POINTER(hid_device_info)),
+]
+
+LIB.hid_init.restype = ctypes.c_int
+LIB.hid_enumerate.restype = ctypes.POINTER(hid_device_info)
+LIB.hid_enumerate.argtypes = [ctypes.c_ushort, ctypes.c_ushort]
+LIB.hid_free_enumeration.argtypes = [ctypes.POINTER(hid_device_info)]
+LIB.hid_open_path.restype = ctypes.c_void_p
+LIB.hid_open_path.argtypes = [ctypes.c_char_p]
+LIB.hid_close.argtypes = [ctypes.c_void_p]
+LIB.hid_set_nonblocking.argtypes = [ctypes.c_void_p, ctypes.c_int]
+LIB.hid_write.restype = ctypes.c_int
+LIB.hid_write.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t]
+LIB.hid_send_feature_report.restype = ctypes.c_int
+LIB.hid_send_feature_report.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t]
+LIB.hid_get_feature_report.restype = ctypes.c_int
+LIB.hid_get_feature_report.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t]
+LIB.hid_read_timeout.restype = ctypes.c_int
+LIB.hid_read_timeout.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_int]
+
+DONGLE_VID, DONGLE_PID = 0x05AC, 0x024F
+WIRED_VID, WIRED_PID = 0x0C45, 0x800A
+RAW_USAGE_PAGE = 0xFF60
+WIRED_CMD_USAGE_PAGE = 0xFF13
+
+MODES = {
+    "off": 0, "static": 1, "singleon": 2, "singleoff": 3, "glittering": 4,
+    "falling": 5, "colourful": 6, "breath": 7, "spectrum": 8, "outward": 9,
+    "scrolling": 10, "rolling": 11, "rotating": 12, "explode": 13, "launch": 14,
+    "ripples": 15, "flowing": 16, "pulsating": 17, "tilt": 18, "shuttle": 19,
+}
+
+def checksum(buf, index=-1):
+    if index < 0:
+        index = len(buf) - 1
+    buf[index] = 0
+    s = sum(buf) & 0xFF
+    buf[index] = s
+
+def find_path(vid, pid, usage_page=None):
+    LIB.hid_init()
+    devs = LIB.hid_enumerate(vid, pid)
+    if not devs:
+        return None
+    cur = devs
+    matches = []
+    allp = []
+    while cur:
+        info = cur.contents
+        if info.path:
+            allp.append(info.path)
+            if usage_page is None or info.usage_page == usage_page:
+                matches.append(info.path)
+        cur = info.next
+    LIB.hid_free_enumeration(devs)
+    if matches:
+        return matches[0]
+    if allp:
+        return allp[0]
+    return None
+
+def open_dev(path):
+    dev = LIB.hid_open_path(path)
+    if dev:
+        LIB.hid_set_nonblocking(dev, 0)
+    return dev
+
+def write_output(dev, data):
+    arr = (ctypes.c_ubyte * len(data))(*data)
+    n = LIB.hid_write(dev, arr, len(data))
+    if n >= 0:
+        return n
+    prefixed = bytes([0]) + bytes(data)
+    arr2 = (ctypes.c_ubyte * len(prefixed))(*prefixed)
+    return LIB.hid_write(dev, arr2, len(prefixed))
+
+def send_feature(dev, data):
+    arr = (ctypes.c_ubyte * len(data))(*data)
+    n = LIB.hid_send_feature_report(dev, arr, len(data))
+    if n >= 0:
+        return n
+    prefixed = bytes([0]) + bytes(data)
+    arr2 = (ctypes.c_ubyte * len(prefixed))(*prefixed)
+    return LIB.hid_send_feature_report(dev, arr2, len(prefixed))
+
+def cmd_exchange(dev, packet):
+    send_feature(dev, packet)
+    buf = (ctypes.c_ubyte * (len(packet) + 1))()
+    buf[0] = 0
+    LIB.hid_get_feature_report(dev, buf, len(buf))
+    return bytes(buf)
+
+# ---------- lighting ----------
+def commit_report():
+    r = bytearray(32)
+    r[0] = 0x0F
+    checksum(r)
+    return bytes(r)
+
+def led_report(mode, brightness, speed, direction, colorful, color):
+    r = bytearray(32)
+    r[0] = 0x05
+    r[1] = 0x10
+    r[2] = 0x00
+    r[3] = mode & 0xFF
+    if mode != 0:
+        r[4] = (color >> 16) & 0xFF
+        r[5] = (color >> 8) & 0xFF
+        r[6] = color & 0xFF
+        r[11] = 1 if colorful else 0
+        r[12] = brightness & 0xFF
+        r[13] = speed & 0xFF
+        r[14] = direction & 0xFF
+    r[17] = 0xAA
+    r[18] = 0x55
+    checksum(r)
+    return bytes(r)
+
+def do_light(args):
+    if args.list:
+        for name, mid in MODES.items():
+            print(f"{mid:2d} {name}")
+        return 0
+    if not args.mode:
+        print("mode required (use --list)", file=sys.stderr)
+        return 2
+    if args.mode.isdigit():
+        mode = int(args.mode)
+    else:
+        mode = MODES.get(args.mode.lower())
+        if mode is None:
+            print("Unknown mode:", args.mode, file=sys.stderr)
+            return 2
+    mode = min(max(mode, 0), 19)
+    brightness = min(max(args.brightness, 1), 5)
+    speed = min(max(args.speed, 1), 5)
+    direction = min(max(args.direction, 0), 3)
+    color = int(args.color, 16)
+
+    path = find_path(DONGLE_VID, DONGLE_PID, RAW_USAGE_PAGE)
+    if not path:
+        print("Dongle not found", file=sys.stderr)
+        return 1
+    dev = open_dev(path)
+    if not dev:
+        print("Failed to open dongle", file=sys.stderr)
+        return 1
+    try:
+        if write_output(dev, commit_report()) < 0:
+            print("commit failed", file=sys.stderr)
+            return 1
+        time.sleep(0.05)
+        if write_output(dev, led_report(mode, brightness, speed, direction, args.colorful, color)) < 0:
+            print("LED write failed", file=sys.stderr)
+            return 1
+        print(f"Applied: mode={mode} brightness={brightness} speed={speed} direction={direction} colorful={args.colorful} color=0x{color:06X}")
+    finally:
+        LIB.hid_close(dev)
+    return 0
+
+# ---------- battery ----------
+def battery_query(include_report_id, length):
+    payload = bytearray(max(length, 0))
+    if not payload:
+        return bytes(payload)
+    if include_report_id:
+        payload[0] = 0
+        if len(payload) > 1:
+            payload[1] = 0x20
+        if len(payload) > 2:
+            payload[2] = 0x01
+    else:
+        payload[0] = 0x20
+        if len(payload) > 1:
+            payload[1] = 0x01
+    idx = 32 if include_report_id else 31
+    if idx < len(payload):
+        payload[idx] = 0
+        s = sum(payload) & 0xFF
+        payload[idx] = s
+    return bytes(payload)
+
+def do_battery(args):
+    path = find_path(DONGLE_VID, DONGLE_PID, RAW_USAGE_PAGE)
+    if not path:
+        print("Dongle not found", file=sys.stderr)
+        return 1
+    dev = open_dev(path)
+    if not dev:
+        print("Failed to open dongle", file=sys.stderr)
+        return 1
+    try:
+        for length in (64, 33, 32):
+            for include in (False, True):
+                write_output(dev, battery_query(include, length))
+                buf = (ctypes.c_ubyte * 512)()
+                cnt = LIB.hid_read_timeout(dev, buf, 512, 250)
+                if cnt >= 4:
+                    if buf[0] == 0x20 and buf[1] == 0x01 and 0 < buf[3] <= 100:
+                        print(f"Battery: {buf[3]}%")
+                        return 0
+                    if cnt >= 5 and buf[1] == 0x20 and buf[2] == 0x01 and 0 < buf[4] <= 100:
+                        print(f"Battery: {buf[4]}%")
+                        return 0
+        print("Battery read failed", file=sys.stderr)
+        return 1
+    finally:
+        LIB.hid_close(dev)
+
+# ---------- performance ----------
+def perf_report(response_level, fn_switch, sleep_time):
+    r = bytearray(32)
+    r[0] = 0x07
+    r[1] = 0x10
+    r[2] = 0x00
+    r[3] = 0x00
+    r[4] = 0x01
+    r[5] = 0x01
+    r[6] = 0x01
+    r[7] = 0x01
+    r[8] = fn_switch & 0xFF
+    r[9] = sleep_time & 0xFF
+    r[11] = response_level & 0xFF
+    r[17] = 0xAA
+    r[18] = 0x55
+    checksum(r)
+    return bytes(r)
+
+def do_perf(args):
+    path = find_path(DONGLE_VID, DONGLE_PID, RAW_USAGE_PAGE)
+    if not path:
+        print("Dongle not found", file=sys.stderr)
+        return 1
+    dev = open_dev(path)
+    if not dev:
+        print("Failed to open dongle", file=sys.stderr)
+        return 1
+    try:
+        level = min(max(args.level, 1), 5)
+        sleep = min(max(args.sleep, 0), 3)
+        if write_output(dev, perf_report(level, 1, sleep)) < 0:
+            print("perf write failed", file=sys.stderr)
+            return 1
+        print(f"Performance: level={level} sleep={sleep}")
+    finally:
+        LIB.hid_close(dev)
+    return 0
+
+# ---------- game mode ----------
+def game_mode_report(response_level, fn_switch, sleep_time, game_mode, disable_alt_tab, disable_alt_f4, disable_win):
+    r = bytearray(perf_report(response_level, fn_switch, sleep_time))
+    r[12] = game_mode & 0xFF
+    r[13] = disable_alt_tab & 0xFF
+    r[14] = disable_alt_f4 & 0xFF
+    r[15] = disable_win & 0xFF
+    checksum(r)
+    return bytes(r)
+
+def do_game_mode(args):
+    path = find_path(DONGLE_VID, DONGLE_PID, RAW_USAGE_PAGE)
+    if not path:
+        print("Dongle not found", file=sys.stderr)
+        return 1
+    dev = open_dev(path)
+    if not dev:
+        print("Failed to open dongle", file=sys.stderr)
+        return 1
+    try:
+        level = min(max(args.level, 1), 5)
+        sleep = min(max(args.sleep, 0), 3)
+        val = 1 if args.on else 0
+        if write_output(dev, game_mode_report(level, 1, sleep, val, val, val, val)) < 0:
+            print("game mode write failed", file=sys.stderr)
+            return 1
+        print(f"Game mode: {'on' if args.on else 'off'} level={level} sleep={sleep}")
+    finally:
+        LIB.hid_close(dev)
+    return 0
+
+# ---------- sync time ----------
+def time_payload(date=None):
+    if date is None:
+        date = datetime.datetime.now()
+    wd = date.weekday()  # Monday=0
+    swift_weekday = ((wd + 1) % 7) + 1
+    p = bytearray(64)
+    p[0] = 0x00
+    p[1] = 0x01
+    p[2] = 0x5A
+    p[3] = 0x1A
+    p[4] = date.month
+    p[5] = date.day
+    p[6] = date.hour
+    p[7] = date.minute
+    p[8] = date.second
+    p[10] = max(swift_weekday - 1, 0)
+    p[62] = 0xAA
+    p[63] = 0x55
+    return bytes(p)
+
+def do_sync_time(args):
+    path = find_path(WIRED_VID, WIRED_PID, WIRED_CMD_USAGE_PAGE)
+    if not path:
+        print("Wired keyboard not found (connect USB-C)", file=sys.stderr)
+        return 1
+    dev = open_dev(path)
+    if not dev:
+        print("Failed to open wired command", file=sys.stderr)
+        return 1
+    try:
+        cmd_exchange(dev, bytes([0x04, 0x18] + [0] * 62))
+        prepare = bytearray(64)
+        prepare[0] = 0x04
+        prepare[1] = 0x28
+        prepare[8] = 0x01
+        cmd_exchange(dev, bytes(prepare))
+        cmd_exchange(dev, time_payload())
+        cmd_exchange(dev, bytes([0x04, 0x02] + [0] * 62))
+        print("Clock synced:", datetime.datetime.now().isoformat(timespec="seconds"))
+    finally:
+        LIB.hid_close(dev)
+    return 0
+
+def main():
+    # Default to light if first arg isn't a known subcommand
+    subcommands = {"light", "battery", "perf", "game-mode", "sync-time"}
+    argv = sys.argv[1:]
+    if argv and argv[0] not in subcommands:
+        argv = ["light"] + argv
+
+    parser = argparse.ArgumentParser(prog="aula-f75", description="Aula F75 Max CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # light
+    pl = sub.add_parser("light", help="set lighting effect")
+    pl.add_argument("mode", nargs="?", help="effect name or 0-19")
+    pl.add_argument("--list", action="store_true", help="list effects")
+    pl.add_argument("-b", "--brightness", type=int, default=4)
+    pl.add_argument("-s", "--speed", type=int, default=3)
+    pl.add_argument("-d", "--direction", type=int, default=0)
+    pl.add_argument("-c", "--color", default="ffffff")
+    pl.add_argument("--colorful", action="store_true")
+    pl.set_defaults(func=do_light)
+
+    # battery
+    pb = sub.add_parser("battery", help="read battery level")
+    pb.set_defaults(func=do_battery)
+
+    # perf
+    pp = sub.add_parser("perf", help="set response level and sleep")
+    pp.add_argument("-l", "--level", type=int, default=2, help="1-5")
+    pp.add_argument("--sleep", type=int, default=2, help="0 none,1 1min,2 5min,3 30min")
+    pp.set_defaults(func=do_perf)
+
+    # game mode
+    pg = sub.add_parser("game-mode", help="toggle game mode")
+    pg.add_argument("--on", action="store_true", help="enable")
+    pg.add_argument("--off", dest="on", action="store_false", help="disable")
+    pg.set_defaults(on=True)
+    pg.add_argument("-l", "--level", type=int, default=2)
+    pg.add_argument("--sleep", type=int, default=2)
+    pg.set_defaults(func=do_game_mode)
+
+    # sync time
+    pt = sub.add_parser("sync-time", help="sync keyboard clock (USB)")
+    pt.set_defaults(func=do_sync_time)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+if __name__ == "__main__":
+    sys.exit(main())
